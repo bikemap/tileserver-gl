@@ -11,7 +11,7 @@ const zlib = require('zlib');
 // see https://github.com/lovell/sharp/issues/371
 const sharp = require('sharp');
 
-const { createCanvas } = require('canvas');
+const { createCanvas, Image } = require('canvas');
 
 const clone = require('clone');
 const Color = require('color');
@@ -97,37 +97,164 @@ function createEmptyResponse(format, color, callback) {
   });
 }
 
+const parseCoordinates = (coordinates, query, transformer) => {
+  const firstCoordinate = parseFloat(coordinates[0]);
+  const secondCoordinate = parseFloat(coordinates[1]);
+
+  let parsedCoordinates;
+
+  if (query.latlng === '1' || query.latlng === 'true') {
+    parsedCoordinates = [secondCoordinate, firstCoordinate];
+  } else {
+    parsedCoordinates = [firstCoordinate, secondCoordinate];
+  }
+
+  if (transformer) {
+    return transformer(parsedCoordinates);
+  }
+
+  return parsedCoordinates;
+};
+
 const extractPathFromQuery = (query, transformer) => {
   const pathParts = (query.path || '').split('|');
   const path = [];
   for (const pair of pathParts) {
     const pairParts = pair.split(',');
     if (pairParts.length === 2) {
-      let pair;
-      if (query.latlng === '1' || query.latlng === 'true') {
-        pair = [+(pairParts[1]), +(pairParts[0])];
-      } else {
-        pair = [+(pairParts[0]), +(pairParts[1])];
-      }
-      if (transformer) {
-        pair = transformer(pair);
-      }
-      path.push(pair);
+      path.push(parseCoordinates(pairParts, query, transformer));
     }
   }
   return path;
 };
 
-const renderOverlay = (z, x, y, bearing, pitch, w, h, scale,
-  path, query) => {
+const extractMarkersFromQuery = (query, transformer, options) => {
+  // Parsers markers provided via query into a list of marker objects
+
+  const markers = [];
+  // Check if multiple markers have been provided and mimic a list if it's a
+  // single maker.
+  const providedMarkers = Array.isArray(query.marker) ?
+    query.marker : [query.marker];
+
+  // Iterate through provided markers which can have one of the following
+  // formats
+  // [location]|[path_to_file_relative_to_configured_icon_path]
+  // [location]|[path_to_file_relative_to_configured_icon_path]|[size]
+  for (const providedMarker of providedMarkers) {
+    const markerParts = providedMarker.split('|')
+    // Ensure we got at least a location and an icon uri
+    if (markerParts.length < 2) {
+      continue;
+    }
+
+    const locationParts = markerParts[0].split(',');
+    // Ensure the location is a coordinate pair
+    if (locationParts.length !== 2) {
+      continue;
+    }
+
+    // Marker-Icons are provided as filepaths relative to configured icon path
+    const iconPath = path.resolve(options.paths.icons, markerParts[1]);
+    // Ensure icon exists at provided path
+    if (!fs.existsSync(iconPath)) {
+      continue;
+    }
+
+    // Construct marker object
+    const marker = {
+      'location': parseCoordinates(locationParts, query, transformer),
+      'icon': iconPath
+    };
+
+    // Check if a size has been provided
+    if (markerParts.length > 2) {
+      const sizes = markerParts[2].split("x");
+      // Check if size is in the format [width]x[height]
+      if (sizes.length == 2) {
+        marker.width = parseFloat(sizes[0]);
+        marker.height = parseFloat(sizes[1]);
+      }
+    }
+
+    // Add marker to list
+    markers.push(marker);
+
+  }
+  return markers;
+};
+
+const precisePx = (ll, zoom) => {
+  // Transforms coordinates to pixels
+  const px = mercator.px(ll, 20);
+  const scale = Math.pow(2, zoom - 20);
+  return [px[0] * scale, px[1] * scale];
+};
+
+const drawMarker = (ctx, marker, z) => {
+  // Draws a local icon on the canvas at a provided location.
+
+  return new Promise(resolve => {
+    const img = new Image();
+    const pixelCoords = precisePx(marker.location, z);
+
+    const getMarkerCoordinates = (imageWidth, imageHeight) => {
+      // Images are placed with their top-left corner at the provided location
+      // within the canvas but we expect icons to be centered and above it.
+      return {
+        // Substract half of the images width from the x-coordinate to center
+        // the image in relation to the provided location
+        'x': pixelCoords[0] - imageWidth / 2,
+        // Substract the images height from the y-coordinate to place it above
+        // the provided location
+        'y': pixelCoords[1] - imageHeight
+      };
+    };
+
+    const drawOnCanvas = () => {
+      // Check if the images should be resized before beeing drawn
+      if (marker.width && marker.height) {
+        // Pass the desired sizes to get correlating coordinates
+        const coords = getMarkerCoordinates(marker.width, marker.height);
+        // Draw the image on canvas
+        ctx.drawImage(img, coords.x, coords.y, marker.width, marker.height);
+      // No resizing query detected
+      } else {
+        // Pass deteced sizes to get correlating coordinates
+        const coords = getMarkerCoordinates(img.width, img.height);
+        // Draw the image on canvas
+        ctx.drawImage(img, coords.x, coords.y);
+      }
+      // Resolve the promise when image has been drawn
+      resolve();
+    };
+
+    img.onload = drawOnCanvas;
+    img.onerror = err => { throw err };
+    img.src = marker.icon;
+  });
+}
+
+
+const drawMarkers = async (ctx, markers, z) => {
+  // Images are expected to load asynchronous in canvas js even when provided
+  // from a local disk.
+  const markerPromises = [];
+
+  for (const marker of markers) {
+    // Begin drawing marker
+    markerPromises.push(drawMarker(ctx, marker, z));
+  }
+
+  // Await marker drawings before continuing
+  await Promise.all(markerPromises);
+}
+
+const renderOverlay = async (z, x, y, bearing, pitch, w, h, scale,
+  path, markers, query) => {
   if (!path || path.length < 2) {
     return null;
   }
-  const precisePx = (ll, zoom) => {
-    const px = mercator.px(ll, 20);
-    const scale = Math.pow(2, zoom - 20);
-    return [px[0] * scale, px[1] * scale];
-  };
 
   const center = precisePx([x, y], z);
 
@@ -151,11 +278,7 @@ const renderOverlay = (z, x, y, bearing, pitch, w, h, scale,
     // optimized path
     ctx.translate(-center[0] + w / 2, -center[1] + h / 2);
   }
-  const lineWidth = query.width !== undefined ?
-    parseFloat(query.width) : 1;
-  ctx.lineWidth = lineWidth;
-  ctx.strokeStyle = query.stroke || 'rgba(0,64,255,0.7)';
-  ctx.fillStyle = query.fill || 'rgba(255,255,255,0.4)';
+
   ctx.beginPath();
   for (const pair of path) {
     const px = precisePx(pair, z);
@@ -165,10 +288,41 @@ const renderOverlay = (z, x, y, bearing, pitch, w, h, scale,
     path[0][1] === path[path.length - 1][1]) {
     ctx.closePath();
   }
-  ctx.fill();
+
+  if (query.fill !== undefined) {
+    ctx.fillStyle = query.fill;
+    ctx.fill();
+  }
+
+  const lineWidth = query.width !== undefined ?
+    parseFloat(query.width) : 1;
+
   if (lineWidth > 0) {
+    // Get border width from query and fall back to 10% of line width
+    const borderWidth = query.borderwidth !== undefined ?
+      parseFloat(query.borderwidth) : lineWidth * 0.1;
+
+    // Set line start/endpoint style
+    ctx.lineCap = query.linecap || 'butt';
+
+    // In order to simulate a border we draw the path two times with the first
+    // beeing the wider border part.
+    if (query.border !== undefined && borderWidth > 0) {
+      // We need to double the desired border width and add it to the line width
+      // in order to get the desired border on each side of the line.
+      ctx.lineWidth = lineWidth + (borderWidth * 2);
+      // Set border style as rgba
+      ctx.strokeStyle = query.border;
+      ctx.stroke();
+    }
+
+    ctx.lineWidth = lineWidth;
+    ctx.strokeStyle = query.stroke || 'rgba(0,64,255,0.7)';
     ctx.stroke();
   }
+
+  // Await drawing of markers before rendering the canvas
+  await drawMarkers(ctx, markers, z);
 
   return canvas.toBuffer();
 };
@@ -396,7 +550,7 @@ module.exports = {
           FLOAT_PATTERN, FLOAT_PATTERN, FLOAT_PATTERN,
           FLOAT_PATTERN, FLOAT_PATTERN);
 
-      app.get(util.format(staticPattern, centerPattern), (req, res, next) => {
+      app.get(util.format(staticPattern, centerPattern), async (req, res, next) => {
         const item = repo[req.params.id];
         if (!item) {
           return res.sendStatus(404);
@@ -426,14 +580,16 @@ module.exports = {
         }
 
         const path = extractPathFromQuery(req.query, transformer);
-        const overlay = renderOverlay(z, x, y, bearing, pitch, w, h, scale,
-          path, req.query);
+        const markers = extractMarkersFromQuery(req.query, transformer,
+          options);
+        const overlay = await renderOverlay(z, x, y, bearing, pitch, w, h,
+          scale, path, markers, req.query);
 
         return respondImage(item, z, x, y, bearing, pitch, w, h, scale, format,
           res, next, overlay);
       });
 
-      const serveBounds = (req, res, next) => {
+      const serveBounds = async (req, res, next) => {
         const item = repo[req.params.id];
         if (!item) {
           return res.sendStatus(404);
@@ -468,8 +624,10 @@ module.exports = {
           pitch = 0;
 
         const path = extractPathFromQuery(req.query, transformer);
-        const overlay = renderOverlay(z, x, y, bearing, pitch, w, h, scale,
-          path, req.query);
+        const markers = extractMarkersFromQuery(req.query, transformer,
+          options);
+        const overlay = await renderOverlay(z, x, y, bearing, pitch, w, h,
+          scale, path, markers, req.query);
         return respondImage(item, z, x, y, bearing, pitch, w, h, scale, format,
           res, next, overlay);
       };
@@ -504,7 +662,7 @@ module.exports = {
 
       const autoPattern = 'auto';
 
-      app.get(util.format(staticPattern, autoPattern), (req, res, next) => {
+      app.get(util.format(staticPattern, autoPattern), async (req, res, next) => {
         const item = repo[req.params.id];
         if (!item) {
           return res.sendStatus(404);
@@ -542,8 +700,10 @@ module.exports = {
           x = center[0],
           y = center[1];
 
-        const overlay = renderOverlay(z, x, y, bearing, pitch, w, h, scale,
-          path, req.query);
+        const markers = extractMarkersFromQuery(req.query, transformer,
+          options);
+        const overlay = await renderOverlay(z, x, y, bearing, pitch, w, h,
+          scale, path, markers, req.query);
 
         return respondImage(item, z, x, y, bearing, pitch, w, h, scale, format,
           res, next, overlay);

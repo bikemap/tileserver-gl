@@ -43,6 +43,14 @@ Static images
   * ``fill`` - color to use as the fill (e.g. ``red``, ``rgba(255,255,255,0.5)``, ``#0000ff``)
   * ``stroke`` - color of the path stroke
   * ``width`` - width of the stroke
+  * ``linecap`` - line cap of the path stroke
+  * ``border`` - color of the optional border path stroke
+  * ``borderwidth`` - width of the border stroke (default 10% of width)
+  * ``marker`` - Marker in format ``lng,lat|icon_path|size`` where icon_path is relative to configured icon path and size is optional
+
+    * can be provided multiple times
+    * e.g. ``5.9,45.8|marker-start.svg|30x40``
+
   * ``padding`` - "percentage" padding for fitted endpoints (area-based and path autofit)
 
     * value of ``0.1`` means "add 10% size to each side to make sure the area of interest is nicely visible"
